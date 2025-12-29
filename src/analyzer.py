@@ -1,3 +1,6 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 from __future__ import annotations
 from datetime import datetime
 from typing import List, Tuple, Optional, Any
@@ -16,7 +19,6 @@ DEAD_PEAK   = 0.02      # pico mínimo (señal normalizada)
 # =========================================================
 
 def normalize_mono(x: np.ndarray) -> np.ndarray:
-    """Convierte a mono si viene en stereo y normaliza si el pico excede 1.0."""
     if x.ndim == 2:
         x = x.mean(axis=1)
     x = x.astype(np.float32, copy=False)
@@ -75,7 +77,7 @@ def welch_db(x: np.ndarray, fs: int, nperseg: int = 4096):
     return f.astype(np.float32), Pxx_db.astype(np.float32)
 
 # =========================================================
-# DETECCIÓN DE BANDERAS (FRECUENCIA) + RECORTE
+# DETECCIÓN DE BANDERAS + RECORTES
 # =========================================================
 
 def detect_frequency_flags(
@@ -88,10 +90,6 @@ def detect_frequency_flags(
     hop_ms: float = 10.0,
     min_sep_s: float = 0.3
 ) -> List[int]:
-    """
-    Detecta múltiples banderas de frecuencia (beeps).
-    Retorna índices (samples) de detección.
-    """
     win = int(fs * win_ms * 1e-3)
     hop = int(fs * hop_ms * 1e-3)
     min_sep = int(min_sep_s * fs)
@@ -116,21 +114,82 @@ def detect_frequency_flags(
 def crop_between_frequency_flags(
     x: np.ndarray,
     fs: int,
+    target_freq: float = 5500.0,
     **kwargs
 ):
-    """
-    Recorta la señal entre la primera y última bandera.
-    Retorna: original, recortado, fs, start_idx, end_idx
-    """
-    offsets = detect_frequency_flags(x, fs, **kwargs)
+    offsets = detect_frequency_flags(x, fs, target_freq=target_freq, **kwargs)
     if len(offsets) < 2:
         return x, x.copy(), fs, 0, len(x)
 
-    start = offsets[0]
-    end   = offsets[-1]
+    start = int(offsets[0])
+    end   = int(offsets[-1])
     end = max(start + 1, min(end, len(x)))
+    return x, x[start:end], fs, start, end
 
-    return x, x[start:end], fs, int(start), int(end)
+# =========================================================
+# SPLIT EN CANALES USANDO BANDERAS INTERNAS (4.5 kHz)
+# =========================================================
+
+def split_by_markers(x: np.ndarray, markers: List[int], n_channels: int = 6) -> List[np.ndarray]:
+    """
+    Construye n_channels segmentos usando boundaries = [0] + markers + [len(x)].
+    Si no hay suficientes boundaries, cae a split_equal_segments.
+    """
+    markers = sorted(set(int(m) for m in markers if 0 <= int(m) <= len(x)))
+    bounds = [0] + markers + [len(x)]
+
+    # limpiar bounds muy cercanas (evita segmentos vacíos)
+    clean = [bounds[0]]
+    for b in bounds[1:]:
+        if b - clean[-1] >= 10:  # mínimo 10 samples
+            clean.append(b)
+    bounds = clean
+
+    if len(bounds) < (n_channels + 1):
+        return split_equal_segments(x, n_channels)
+
+    # usa las primeras n_channels+1 boundaries
+    bounds = bounds[:(n_channels + 1)]
+    segs = []
+    for i in range(n_channels):
+        a, b = bounds[i], bounds[i+1]
+        segs.append(x[a:b])
+    return segs
+
+def split_equal_segments(x: np.ndarray, n: int = 6) -> List[np.ndarray]:
+    if n <= 0:
+        return [x]
+    L = len(x)
+    if L == 0:
+        return [x.copy() for _ in range(n)]
+    size = max(1, L // n)
+    segs = []
+    for i in range(n):
+        a = i * size
+        b = (i + 1) * size if i < n - 1 else L
+        segs.append(x[a:b])
+    return segs
+
+def split_channels_by_internal_beeps(
+    x: np.ndarray,
+    fs: int,
+    n_channels: int = 6,
+    marker_freq: float = 4500.0,
+    freq_tol: float = 40.0,
+    threshold_db: float = -40.0
+) -> Tuple[List[np.ndarray], List[int]]:
+    """
+    Detecta beeps internos (4.5 kHz) y segmenta.
+    Devuelve: (segments, markers)
+    """
+    markers = detect_frequency_flags(
+        x, fs,
+        target_freq=marker_freq,
+        freq_tol=freq_tol,
+        threshold_db=threshold_db
+    )
+    segs = split_by_markers(x, markers, n_channels=n_channels)
+    return segs, markers
 
 # =========================================================
 # BANDAS PARA COMPARACIÓN
@@ -156,20 +215,6 @@ def band_energy_db(f, psd_db, band):
 # =========================================================
 
 def analyze_pair(x_ref: np.ndarray, x_cur: np.ndarray, fs: int) -> dict:
-    """
-    Retorna un dict CONSISTENTE para un canal:
-    {
-      "Evaluacion": "PASSED"/"FAILED",
-      "Estado": "VIVO"/"MUERTO",
-      "ref": {LFE,LF,MF,HF},
-      "cine": {LFE,LF,MF,HF},
-      "delta": {LFE,LF,MF,HF},
-      "rms": {...},
-      "crest": {...},
-      "peak_cur": ...,
-      "dead_channel": bool
-    }
-    """
     rms_ref = float(rms_db(x_ref))
     rms_cur = float(rms_db(x_cur))
 
@@ -178,10 +223,8 @@ def analyze_pair(x_ref: np.ndarray, x_cur: np.ndarray, fs: int) -> dict:
 
     peak_cur = float(np.max(np.abs(x_cur)) + 1e-12)
 
-    # ===== DETECCIÓN DE CANAL MUERTO =====
     dead_abs = (rms_cur < DEAD_RMS_DB) or (peak_cur < DEAD_PEAK)
 
-    # PSD
     f_ref, psd_ref = welch_db(x_ref, fs)
     f_cur, psd_cur = welch_db(x_cur, fs)
 
@@ -207,26 +250,7 @@ def analyze_pair(x_ref: np.ndarray, x_cur: np.ndarray, fs: int) -> dict:
     }
 
 # =========================================================
-# SPLIT EN 6 CANALES (UNO TRAS OTRO)
-# =========================================================
-
-def split_equal_segments(x: np.ndarray, n: int = 6) -> List[np.ndarray]:
-    """Divide una señal en n segmentos iguales (último puede quedar un poco más corto)."""
-    if n <= 0:
-        return [x]
-    L = len(x)
-    if L == 0:
-        return [x.copy() for _ in range(n)]
-    size = max(1, L // n)
-    segs = []
-    for i in range(n):
-        a = i * size
-        b = (i + 1) * size if i < n - 1 else L
-        segs.append(x[a:b])
-    return segs
-
-# =========================================================
-# PAYLOAD PARA THINGSBOARD
+# PAYLOAD THINGSBOARD (Canal1..Canal6)
 # =========================================================
 
 def build_json_payload(
@@ -235,15 +259,6 @@ def build_json_payload(
     channel_results: List[dict],
     *args, **kwargs
 ) -> dict:
-    """
-    Payload EXACTO que necesitas:
-    {
-      "Canal1": {...},
-      "Canal2": {...},
-      ...
-      "Canal6": {...}
-    }
-    """
     payload: dict = {}
     for i, ch in enumerate(channel_results, start=1):
         payload[f"Canal{i}"] = {
@@ -256,7 +271,7 @@ def build_json_payload(
     return payload
 
 # =========================================================
-# JSON SAFE (evita errores con numpy types)
+# JSON SAFE
 # =========================================================
 
 def json_safe(obj: Any):
