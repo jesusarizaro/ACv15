@@ -13,6 +13,7 @@ from ttkbootstrap.constants import *
 
 import numpy as np
 import soundfile as sf
+
 import matplotlib
 matplotlib.use("TkAgg")
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
@@ -22,20 +23,15 @@ from app_platform import APP_DIR, ASSETS_DIR, ensure_dirs
 from configio import load_config, save_config
 from iot_tb import send_json_to_thingsboard
 
-from analyzer import crop_between_frequency_flags
-
-
 from analyzer import (
     normalize_mono,
     record_audio,
     analyze_pair,
     build_json_payload,
-    crop_between_frequency_flags
+    crop_between_frequency_flags,
+    split_equal_segments,
+    json_safe
 )
-
-
-
-
 
 APP_NAME = "AudioCinema"
 SAVE_DIR = (APP_DIR / "data" / "captures").absolute()
@@ -70,7 +66,7 @@ def pick_input_device(preferred_name_substr: Optional[str] = None) -> Optional[i
     if ENV_INPUT_INDEX:
         try:
             idx = int(ENV_INPUT_INDEX)
-            if 0 <= idx < len(devices) and devices[idx].get("max_input_channels",0) > 0:
+            if 0 <= idx < len(devices) and devices[idx].get("max_input_channels", 0) > 0:
                 return idx
         except Exception:
             pass
@@ -78,11 +74,11 @@ def pick_input_device(preferred_name_substr: Optional[str] = None) -> Optional[i
     if preferred_name_substr:
         s = preferred_name_substr.lower()
         for i, d in enumerate(devices):
-            if s in str(d.get("name","")).lower() and d.get("max_input_channels",0) > 0:
+            if s in str(d.get("name", "")).lower() and d.get("max_input_channels", 0) > 0:
                 return i
 
     for i, d in enumerate(devices):
-        if d.get("max_input_channels",0) > 0:
+        if d.get("max_input_channels", 0) > 0:
             return i
     return None
 
@@ -106,14 +102,12 @@ class AudioCinemaGUI:
         self.root = root
         self.root.title(APP_NAME)
 
-        # Tema y fondo gris
         tb.Style(theme="flatly")
         try:
             self.root.configure(bg="#e6e6e6")
         except Exception:
             pass
 
-        # Icono en ventana
         self._icon_img = None
         try:
             icon_path = ASSETS_DIR / "audiocinema.png"
@@ -122,6 +116,7 @@ class AudioCinemaGUI:
                 self.root.iconphoto(True, self._icon_img)
         except Exception:
             self._icon_img = None
+
         try:
             self.root.wm_class(APP_NAME, APP_NAME)
         except Exception:
@@ -130,24 +125,14 @@ class AudioCinemaGUI:
         ensure_dirs()
         self.cfg = load_config()
 
-        # Variables visibles (cabecera)
         self.fs = tk.IntVar(value=int(self._cfg(["audio","fs"], 48000)))
-        self.duration = tk.DoubleVar(value=float(self._cfg(["audio","duration_s"], 10.0)))
+        self.duration = tk.DoubleVar(value=float(self._cfg(["audio","duration_s"], 60.0)))
 
         self.input_device_index: Optional[int] = None
         self.test_name = tk.StringVar(value="—")
         self.eval_text = tk.StringVar(value="—")
 
-        # buffers de ondas últimas
-        self.last_ref: Optional[np.ndarray] = None
-        self.last_cur: Optional[np.ndarray] = None
         self.last_fs: int = int(self.fs.get())
-
-        # markers/segments para JSON
-        self.ref_markers: List[int] = []
-        self.cur_markers: List[int] = []
-        self.ref_segments: List[Tuple[int,int]] = []
-        self.cur_segments: List[Tuple[int,int]] = []
 
         self._build_ui()
         self._auto_select_input_device()
@@ -177,77 +162,69 @@ class AudioCinemaGUI:
         paned = ttk.Panedwindow(root_frame, orient=HORIZONTAL)
         paned.pack(fill=BOTH, expand=True)
 
-        # --------- IZQUIERDA: logo + 4 botones ---------
-        left = ttk.Frame(paned, padding=(6,6))
+        # --------- IZQUIERDA ---------
+        left = ttk.Frame(paned, padding=(6, 6))
         paned.add(left, weight=1)
 
         card = ttk.Frame(left, padding=6)
         card.pack(fill=Y, expand=False)
 
         if self._icon_img is not None:
-            ttk.Label(card, image=self._icon_img).pack(anchor="n", pady=(0,4))
+            ttk.Label(card, image=self._icon_img).pack(anchor="n", pady=(0, 4))
         ttk.Label(card, text="AudioCinema", font=("Segoe UI", 18, "bold")).pack(anchor="n")
 
         desc = ("Graba, evalúa y analiza tu sistema de audio "
                 "para garantizar la mejor experiencia envolvente.")
-        ttk.Label(card, text=desc, wraplength=220, justify="center").pack(anchor="n", pady=(6,10))
+        ttk.Label(card, text=desc, wraplength=220, justify="center").pack(anchor="n", pady=(6, 10))
 
         btn_style = {"bootstyle": PRIMARY, "width": 20}
         tb.Button(card, text="Información",   command=self._show_info, **btn_style).pack(pady=6, fill=X)
         tb.Button(card, text="Configuración", command=self._popup_config, **btn_style).pack(pady=6, fill=X)
         tb.Button(card, text="Confirmación",  command=self._popup_confirm, **btn_style).pack(pady=6, fill=X)
-        tb.Button(card, text="Prueba ahora",  command=self._run_once, **btn_style).pack(pady=(6,0), fill=X)
+        tb.Button(card, text="Prueba ahora",  command=self._run_once, **btn_style).pack(pady=(6, 0), fill=X)
 
         # separador vertical
         sep = ttk.Separator(root_frame, orient=VERTICAL)
         paned.add(sep)
 
-        # --------- DERECHA: cabecera + ondas + mensajes ---------
-        right = ttk.Frame(paned, padding=(8,6))
+        # --------- DERECHA ---------
+        right = ttk.Frame(paned, padding=(8, 6))
         paned.add(right, weight=4)
 
         header = ttk.Frame(right)
-        header.pack(fill=X, pady=(0,8))
+        header.pack(fill=X, pady=(0, 8))
 
-        ttk.Label(header, text="PRUEBA:", font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w", padx=(0,6))
+        ttk.Label(header, text="PRUEBA:", font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w", padx=(0, 6))
         e = ttk.Entry(header, textvariable=self.test_name, width=32, state="readonly", justify="center")
         e.grid(row=0, column=1, sticky="w")
 
-        ttk.Label(header, text="EVALUACIÓN:", font=("Segoe UI", 10, "bold")).grid(row=1, column=0, sticky="w", padx=(0,6), pady=(6,0))
+        ttk.Label(header, text="EVALUACIÓN:", font=("Segoe UI", 10, "bold")).grid(row=1, column=0, sticky="w", padx=(0, 6), pady=(6, 0))
         self.eval_lbl = ttk.Label(header, textvariable=self.eval_text, font=("Segoe UI", 11, "bold"), foreground="#333")
-        self.eval_lbl.grid(row=1, column=1, sticky="w", pady=(6,0))
+        self.eval_lbl.grid(row=1, column=1, sticky="w", pady=(6, 0))
 
         fig_card = ttk.Frame(right, padding=4)
         fig_card.pack(fill=BOTH, expand=True)
 
         self.fig = Figure(figsize=(7, 8), dpi=100)
 
-        #-----------------------------------------
-        #self.ax_ref = self.fig.add_subplot(2,1,1)
-        #self.ax_cur = self.fig.add_subplot(2,1,2)
-        #-----------------------------------------
         self.ax_ref_orig = self.fig.add_subplot(2, 2, 1)
         self.ax_ref_cut  = self.fig.add_subplot(2, 2, 2)
         self.ax_cur_orig = self.fig.add_subplot(2, 2, 3)
         self.ax_cur_cut  = self.fig.add_subplot(2, 2, 4)
 
-
-        
         self.canvas = FigureCanvasTkAgg(self.fig, master=fig_card)
         self.canvas.get_tk_widget().pack(fill=BOTH, expand=True)
 
         self._clear_waves()
         self.fig.tight_layout()
 
-        # Mensajes
         msg_card = ttk.Frame(right, padding=4)
-        msg_card.pack(fill=BOTH, expand=False, pady=(6,0))
+        msg_card.pack(fill=BOTH, expand=False, pady=(6, 0))
         ttk.Label(msg_card, text="Mensajes", font=("Segoe UI", 10, "bold")).pack(anchor="w")
         self.msg_text = tk.Text(msg_card, height=6, wrap="word")
         self.msg_text.pack(fill=BOTH, expand=True)
         self._set_messages(["Listo. Presiona «Prueba ahora» para iniciar."])
 
-    #-------------------------------------------------------------------------------------NUEVO
     def _clear_waves(self):
         axes = [
             (self.ax_ref_orig, "Referencia – ORIGINAL"),
@@ -255,16 +232,12 @@ class AudioCinemaGUI:
             (self.ax_cur_orig, "Prueba – ORIGINAL"),
             (self.ax_cur_cut,  "Prueba – RECORTADA"),
         ]
-    
         for ax, title in axes:
             ax.clear()
             ax.set_title(title)
             ax.set_xlabel("Tiempo (s)")
             ax.set_ylabel("Amplitud")
             ax.grid(True, axis="x", ls=":")
-
-    #-------------------------------------------------------------------------------------NUEVO
-
 
     def _plot_wave(self, ax, x: np.ndarray, fs: int):
         n = len(x)
@@ -291,7 +264,7 @@ class AudioCinemaGUI:
 
     # ----------------- acciones -----------------
     def _auto_select_input_device(self):
-        pref = str(self._cfg(["audio","preferred_input_name"], ""))
+        pref = str(self._cfg(["audio", "preferred_input_name"], ""))
         self.input_device_index = pick_input_device(pref)
 
     @ui_action
@@ -301,14 +274,14 @@ class AudioCinemaGUI:
     @ui_action
     def _popup_confirm(self):
         tb_cfg = {
-            "host": self._cfg(["thingsboard","host"], "thingsboard.cloud"),
-            "port": self._cfg(["thingsboard","port"], 1883),
-            "use_tls": self._cfg(["thingsboard","use_tls"], False),
-            "token": self._cfg(["thingsboard","token"], ""),
+            "host": self._cfg(["thingsboard", "host"], "thingsboard.cloud"),
+            "port": self._cfg(["thingsboard", "port"], 1883),
+            "use_tls": self._cfg(["thingsboard", "use_tls"], False),
+            "token": self._cfg(["thingsboard", "token"], ""),
         }
         txt = (
             f"Archivo de referencia:\n  {self._cfg(['reference','wav_path'], str(ASSETS_DIR/'reference_master.wav'))}\n\n"
-            f"Audio:\n  fs={self._cfg(['audio','fs'],48000)}  duración={self._cfg(['audio','duration_s'],10.0)} s\n"
+            f"Audio:\n  fs={self._cfg(['audio','fs'],48000)}  duración={self._cfg(['audio','duration_s'],60.0)} s\n"
             f"  preferir dispositivo='{self._cfg(['audio','preferred_input_name'],'')}'\n\n"
             f"ThingsBoard:\n  host={tb_cfg['host']}  port={tb_cfg['port']}  TLS={tb_cfg['use_tls']}\n"
             f"  token={tb_cfg['token']}\n\n"
@@ -330,7 +303,6 @@ class AudioCinemaGUI:
         frm = ttk.Frame(w, padding=10); frm.pack(fill=BOTH, expand=True)
         nb = ttk.Notebook(frm); nb.pack(fill=BOTH, expand=True)
 
-        # -------- General --------
         g = ttk.Frame(nb); nb.add(g, text="General")
         ref_var = tk.StringVar(value=self._cfg(["reference","wav_path"], str(ASSETS_DIR/"reference_master.wav")))
         oncal_var = tk.StringVar(value=self._cfg(["oncalendar"], "*-*-* 02:00:00"))
@@ -339,10 +311,9 @@ class AudioCinemaGUI:
         ttk.Label(g, text="OnCalendar (systemd):").grid(row=1, column=0, sticky="w", pady=(6,2))
         ttk.Entry(g, textvariable=oncal_var, width=30).grid(row=1, column=1, sticky="w", pady=(6,2))
 
-        # -------- Audio --------
         a = ttk.Frame(nb); nb.add(a, text="Audio")
         fs_var = tk.IntVar(value=int(self._cfg(["audio","fs"], 48000)))
-        dur_var = tk.DoubleVar(value=float(self._cfg(["audio","duration_s"], 10.0)))
+        dur_var = tk.DoubleVar(value=float(self._cfg(["audio","duration_s"], 60.0)))
         pref_in = tk.StringVar(value=self._cfg(["audio","preferred_input_name"], ""))
         ttk.Label(a, text="Sample Rate (Hz):").grid(row=0, column=0, sticky="w", pady=(6,2))
         ttk.Entry(a, textvariable=fs_var, width=10).grid(row=0, column=1, sticky="w")
@@ -351,7 +322,6 @@ class AudioCinemaGUI:
         ttk.Label(a, text="Preferir dispositivo:").grid(row=2, column=0, sticky="w", pady=(6,2))
         ttk.Entry(a, textvariable=pref_in, width=28).grid(row=2, column=1, sticky="w")
 
-        # -------- ThingsBoard --------
         t = ttk.Frame(nb); nb.add(t, text="ThingsBoard")
         host_var = tk.StringVar(value=self._cfg(["thingsboard","host"], "thingsboard.cloud"))
         port_var = tk.IntVar(value=int(self._cfg(["thingsboard","port"], 1883)))
@@ -365,226 +335,8 @@ class AudioCinemaGUI:
         ttk.Label(t, text="Token:").grid(row=3, column=0, sticky="w", pady=(6,2))
         ttk.Entry(t, textvariable=token_var, width=40).grid(row=3, column=1, sticky="w")
 
-        # -------- Pista de referencia (nueva) -------------------------------------------------------------------
-        # -------- Pista de referencia --------
-        r = ttk.Frame(nb)
-        nb.add(r, text="Pista de referencia")
-
-        r.grid_columnconfigure(0, weight=1)
-        r.grid_columnconfigure(1, weight=1)
-
-        # =========================
-        # FIGURA (2 GRÁFICAS)
-        # =========================
-        fig_ref = Figure(figsize=(8, 3), dpi=100)
-
-        ax_ref_orig = fig_ref.add_subplot(1, 2, 1)
-        ax_ref_cut  = fig_ref.add_subplot(1, 2, 2)
-
-        fig_ref.subplots_adjust(
-            left=0.08,
-            right=0.95,
-            top=0.90,
-            bottom=0.20,
-            wspace=0.30
-        )
-
-
-        for ax, title in [
-            (ax_ref_orig, "Referencia – ORIGINAL"),
-            (ax_ref_cut,  "Referencia – RECORTADA"),
-        ]:
-            ax.set_title(title)
-            ax.set_xlabel("Tiempo (s)")
-            ax.set_ylabel("Amplitud")
-            ax.grid(True, axis="x", linestyle=":", linewidth=0.8)
-
-
-        canvas_ref = FigureCanvasTkAgg(fig_ref, master=r)
-        canvas_ref.get_tk_widget().grid(
-            row=0, column=0, columnspan=2,
-            sticky="nsew", padx=10, pady=(10, 8)
-        )
-
-        # =========================
-        # RUTA (alineada a la izquierda)
-        # =========================
-        ref_path_var = tk.StringVar(value=ref_var.get())
-
-        path_row = ttk.Frame(r)
-        path_row.grid(
-            row=1,
-            column=0,
-            columnspan=2,
-            pady=(6, 2),
-            sticky="n"
-        )
-
-        ttk.Label(
-            path_row,
-            text="Ruta de la Pista de Referencia:"
-        ).pack(side="left", padx=(0, 6))
-
-        ttk.Label(
-            path_row,
-            textvariable=ref_path_var,
-            foreground="#444",
-            wraplength=600,
-            justify="left"
-        ).pack(side="left")
-
-
-        # =========================
-        # FECHA
-        # =========================
-        ref_date_var = tk.StringVar(value="—")
-
-        date_row = ttk.Frame(r)
-        date_row.grid(
-            row=2,
-            column=0,
-            columnspan=2,
-            pady=(2, 8),
-            sticky="n"
-        )
-
-        ttk.Label(
-            date_row,
-            text="Fecha de la Pista de Referencia:"
-        ).pack(side="left", padx=(0, 6))
-
-        ttk.Label(
-            date_row,
-            textvariable=ref_date_var,
-            foreground="#444"
-        ).pack(side="left")
-
-
-        def cargar_referencia_existente():
-            try:
-                ref_path = Path(ref_var.get()).resolve()
-
-                if not ref_path.exists():
-                    return  # no hay referencia aún
-
-                # cargar audio
-                x, fs0 = sf.read(ref_path, dtype="float32", always_2d=False)
-                if x.ndim == 2:
-                    x = x.mean(axis=1)
-
-                # recorte
-                x_o, x_cut, fs_u, s, e = crop_between_frequency_flags(x, fs0)
-
-                # plot
-                ax_ref_orig.clear()
-                ax_ref_cut.clear()
-
-                t1 = np.arange(len(x_o)) / fs_u
-                t2 = np.arange(len(x_cut)) / fs_u
-
-                ax_ref_orig.plot(t1, x_o, lw=0.7)
-                ax_ref_cut.plot(t2, x_cut, lw=0.7)
-
-                ax_ref_orig.axvline(s / fs_u, ls="--", color="green")
-                ax_ref_orig.axvline(e / fs_u, ls="--", color="red")
-
-                ax_ref_orig.set_title("Referencia – ORIGINAL")
-                ax_ref_cut.set_title("Referencia – RECORTADA")
-
-                for ax in (ax_ref_orig, ax_ref_cut):
-                    ax.set_xlabel("Tiempo")
-                    ax.set_ylabel("Amplitud")
-                    ax.grid(True, axis="x", linestyle=":", linewidth=0.8)
-
-                canvas_ref.draw_idle()
-
-                # metadata
-                ref_path_var.set(str(ref_path))
-                mtime = datetime.fromtimestamp(ref_path.stat().st_mtime)
-                ref_date_var.set(mtime.strftime("%Y-%m-%d %H:%M:%S"))
-
-            except Exception as e:
-                print("No se pudo cargar referencia existente:", e)
-
-
-
-
-
-        # =========================
-        # BOTÓN GRABAR
-        # =========================
-        def grabar_referencia():
-            fs_now = int(fs_var.get())
-            dur_now = float(dur_var.get())
-
-            try:
-                x = record_audio(
-                    dur_now,
-                    fs=fs_now,
-                    channels=1,
-                    device=self.input_device_index
-                )
-
-                ASSETS_DIR.mkdir(parents=True, exist_ok=True)
-                out = (ASSETS_DIR / "reference_master.wav").resolve()
-                sf.write(out, x, fs_now)
-
-                # UI
-                ref_var.set(str(out))
-                ref_path_var.set(str(out))
-                ref_date_var.set(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-
-                # recorte
-                x_o, x_cut, fs_u, s, e = crop_between_frequency_flags(x, fs_now)
-
-                # plot
-                ax_ref_orig.clear()
-                ax_ref_cut.clear()
-
-                t1 = np.arange(len(x_o)) / fs_u
-                t2 = np.arange(len(x_cut)) / fs_u
-
-                ax_ref_orig.plot(t1, x_o, lw=0.7)
-                ax_ref_cut.plot(t2, x_cut, lw=0.7)
-
-                ax_ref_orig.axvline(s / fs_u, ls="--", color="green")
-                ax_ref_orig.axvline(e / fs_u, ls="--", color="red")
-
-                ax_ref_orig.set_title("Referencia – ORIGINAL")
-                ax_ref_cut.set_title("Referencia – RECORTADA")
-
-                for ax in (ax_ref_orig, ax_ref_cut):
-                    ax.set_xlabel("Tiempo")
-                    ax.set_ylabel("Amplitud")
-                    ax.grid(True, axis="x", linestyle=":", linewidth=0.8)
-
-
-                fig_ref.tight_layout()
-                canvas_ref.draw_idle()
-
-            except Exception as e:
-                messagebox.showerror("Pista de referencia", str(e))
-
-        ttk.Button(
-            r,
-            text="Grabar Pista de Referencia",
-            command=grabar_referencia
-        ).grid(
-            row=4,
-            column=0,
-            columnspan=2,
-            pady=(10, 14),
-            sticky="n"
-        )
-
-
-        cargar_referencia_existente()
-
-
-        
-
-        # Barra guardar/cancelar
         btns = ttk.Frame(frm); btns.pack(fill=X, pady=(10,0))
+
         def on_save():
             self._set_cfg(["reference","wav_path"], ref_var.get().strip())
             self._set_cfg(["oncalendar"], oncal_var.get().strip())
@@ -597,9 +349,8 @@ class AudioCinemaGUI:
             self._set_cfg(["thingsboard","token"], token_var.get().strip())
             save_config(self.cfg)
 
-            # sincroniza cabecera
             self.fs.set(int(self._cfg(["audio","fs"], 48000)))
-            self.duration.set(float(self._cfg(["audio","duration_s"], 10.0)))
+            self.duration.set(float(self._cfg(["audio","duration_s"], 60.0)))
 
             messagebox.showinfo(APP_NAME, "Configuración guardada.")
             w.destroy()
@@ -615,7 +366,6 @@ class AudioCinemaGUI:
 
     @ui_action
     def _run_once(self):
-        # Lee SIEMPRE desde config (garantiza consistencia)
         fs  = int(self._cfg(["audio","fs"], 48000))
         dur = float(self._cfg(["audio","duration_s"], 60.0))
         self.last_fs = fs
@@ -629,118 +379,62 @@ class AudioCinemaGUI:
         if getattr(x_ref, "ndim", 1) == 2:
             x_ref = x_ref.mean(axis=1)
         x_ref = normalize_mono(x_ref)
+
+        # resample simple si hiciera falta
         if fs_ref != fs:
             n_new = int(round(len(x_ref) * fs / fs_ref))
             x_idx = np.linspace(0, 1, len(x_ref))
             new_idx = np.linspace(0, 1, n_new)
             x_ref = np.interp(new_idx, x_idx, x_ref).astype(np.float32)
 
-        # 2) grabar muestra
+        # 2) grabar prueba
         x_cur = record_audio(dur, fs=fs, channels=1, device=self.input_device_index)
 
-        # 3) recortar por banderas (5500 Hz)
-        x_ref_o, x_ref_cut, fs, ref_start, ref_end = crop_between_frequency_flags(
-            x_ref, fs
-        )
+        # 3) recorte por banderas 5500Hz (global)
+        x_ref_o, x_ref_cut, fs, ref_start, ref_end = crop_between_frequency_flags(x_ref, fs)
+        x_cur_o, x_cur_cut, fs, cur_start, cur_end = crop_between_frequency_flags(x_cur, fs)
 
-        x_cur_o, x_cur_cut, fs, cur_start, cur_end = crop_between_frequency_flags(
-            x_cur, fs
-        )
-        
-        # 4) analizar SOLO las señales recortadas
-        res = analyze_pair(x_ref_cut, x_cur_cut, fs)
-        self._set_eval(res["overall"] == "PASSED")
-        
-        # 5) beeps/segments para JSON (sobre recortadas)
-        x_ref_orig, x_ref_cut, fs, ref_start, ref_end = crop_between_frequency_flags(
-            x_ref, fs
-        )
-
-        x_cur_orig, x_cur_cut, fs, cur_start, cur_end = crop_between_frequency_flags(
-            x_cur, fs
-        )
-
-        
-        # 6) dibujar ondas (4 gráficas)
-        # =========================
-        # RECORTE POR BANDERAS 5500 Hz
-        # =========================
-        x_ref_o, x_ref_cut, fs, ref_start, ref_end = crop_between_frequency_flags(
-            x_ref, fs
-        )
-        
-        x_cur_o, x_cur_cut, fs, cur_start, cur_end = crop_between_frequency_flags(
-            x_cur, fs
-        )
-
-
-
-
-        from analyzer import split_equal_segments
-
+        # 4) dividir en 6 segmentos (canales por turno)
         ref_segs = split_equal_segments(x_ref_cut, 6)
         cur_segs = split_equal_segments(x_cur_cut, 6)
-        
+
         channel_results = []
-        for i, (rseg, cseg) in enumerate(zip(ref_segs, cur_segs), start=1):
-            res = analyze_pair(rseg, cseg, fs)
-            channel_results.append(res)
+        for rseg, cseg in zip(ref_segs, cur_segs):
+            channel_results.append(analyze_pair(rseg, cseg, fs))
 
+        # 5) evaluación global REAL
+        global_passed = all(ch["Evaluacion"] == "PASSED" for ch in channel_results)
+        self._set_eval(global_passed)
 
-
-
-
-        
-        # =========================
-        # DIBUJAR 4 GRÁFICAS
-        # =========================
+        # 6) dibujar 4 gráficas (como ya te funciona)
         self._clear_waves()
-        
+
         self._plot_wave(self.ax_ref_orig, x_ref_o, fs)
         self.ax_ref_orig.axvline(ref_start / fs, color="green", ls="--")
         self.ax_ref_orig.axvline(ref_end   / fs, color="red",   ls="--")
-        
+
         self._plot_wave(self.ax_ref_cut, x_ref_cut, fs)
-        
+
         self._plot_wave(self.ax_cur_orig, x_cur_o, fs)
         self.ax_cur_orig.axvline(cur_start / fs, color="green", ls="--")
         self.ax_cur_orig.axvline(cur_end   / fs, color="red",   ls="--")
-        
+
         self._plot_wave(self.ax_cur_cut, x_cur_cut, fs)
-        
+
         self.canvas.draw_idle()
 
-
-        # 6) nombre de la prueba (no editable)
+        # 7) nombre de la prueba
         self.test_name.set(datetime.now().strftime("Test_%Y-%m-%d_%H-%M-%S"))
 
-        # 7) exportar y enviar
-        results = []
-        
-        for ch in range(6):
-            results.append(res)
-        
-        payload = build_json_payload(
-            fs,
-            None,
-            results,
-            [], [], [], [],
-            None,
-            None
-        )
+        # 8) payload ThingsBoard
+        payload = build_json_payload(fs, None, channel_results)
 
-
-
-
-        
-
+        # 9) guardar JSON
         out = EXPORT_DIR / f"analysis_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.json"
         with open(out, "w", encoding="utf-8") as f:
-            from analyzer import json_safe
-
             json.dump(json_safe(payload), f, ensure_ascii=False, indent=2)
 
-
+        # 10) enviar a TB
         sent = False
         host = self._cfg(["thingsboard","host"], "thingsboard.cloud")
         port = int(self._cfg(["thingsboard","port"], 1883))
@@ -749,11 +443,15 @@ class AudioCinemaGUI:
         if token:
             sent = send_json_to_thingsboard(payload, host, port, token, use_tls)
 
-        self._set_messages([
-            "La prueba ha " + ("aprobado." if res["overall"] == "PASSED" else "fallado."),
-            f"JSON: {out}",
-            ("Resultados enviados a ThingsBoard." if sent else "No se enviaron resultados a ThingsBoard.")
-        ])
+        # 11) mensajes (incluye estado por canal)
+        lines = []
+        lines.append("La prueba ha " + ("aprobado." if global_passed else "fallado."))
+        for i, ch in enumerate(channel_results, start=1):
+            lines.append(f"Canal{i}: {ch['Estado']} / {ch['Evaluacion']}")
+        lines.append(f"JSON: {out}")
+        lines.append("Resultados enviados a ThingsBoard." if sent else "No se enviaron resultados a ThingsBoard.")
+
+        self._set_messages(lines)
         messagebox.showinfo(APP_NAME, f"Análisis terminado.\nJSON: {out}")
 
 
