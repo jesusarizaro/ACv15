@@ -1,0 +1,10 @@
+[Unit]
+Description=AudioCinema Analyzer (scheduled)
+
+[Timer]
+OnCalendar=__ONCALENDAR__
+Persistent=true
+Unit=audiocinema.service
+
+[Install]
+WantedBy=timers.target

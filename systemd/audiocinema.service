@@ -1,0 +1,13 @@
+[Unit]
+Description=AudioCinema Analyzer (manual run)
+After=network.target sound.target
+
+[Service]
+Type=simple
+ExecStart=__PY__ __APP_DIR__/src/gui_app.py
+User=__USER__
+WorkingDirectory=__APP_DIR__
+Restart=no
+
+[Install]
+WantedBy=multi-user.target
