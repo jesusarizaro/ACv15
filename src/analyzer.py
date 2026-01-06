@@ -3,7 +3,8 @@
 
 from __future__ import annotations
 from datetime import datetime
-from typing import List, Tuple, Optional, Any
+#from typing import List, Tuple, Optional, Any
+from typing import List, Tuple, Optional, Any, Sequence
 
 import numpy as np
 import sounddevice as sd
@@ -80,50 +81,81 @@ def welch_db(x: np.ndarray, fs: int, nperseg: int = 4096):
 # DETECCIÓN DE BANDERAS + RECORTES
 # =========================================================
 
-def detect_frequency_flags(
+#def detect_frequency_flags(
+def detect_tone_events(
     x: np.ndarray,
     fs: int,
-    target_freq: float = 5500.0,
+    target_freqs: Sequence[float],
     freq_tol: float = 40.0,
     threshold_db: float = -40.0,
     win_ms: float = 30.0,
     hop_ms: float = 10.0,
-    min_sep_s: float = 0.3
-) -> List[int]:
+    min_sep_s: float = 0.3,
+) -> List[Tuple[int, float]]:
+    """
+    Detecta eventos de tonos discretos.
+
+    Retorna una lista de (offset, freq_objetivo) ordenada por tiempo. En cada frame
+    se selecciona el objetivo con mayor magnitud que supere el umbral.
+    """
+
+    targets = sorted(set(float(f) for f in target_freqs if f > 0))
     win = int(fs * win_ms * 1e-3)
     hop = int(fs * hop_ms * 1e-3)
     min_sep = int(min_sep_s * fs)
 
-    offsets: List[int] = []
-    if win <= 0 or hop <= 0 or len(x) < win:
-        return offsets
+    events: List[Tuple[int, float]] = []
+    if win <= 0 or hop <= 0 or len(x) < win or not targets:
+        return events
+
+    hwin = np.hanning(win)
+    freqs = np.fft.rfftfreq(win, d=1 / fs)
 
     for i in range(0, len(x) - win, hop):
-        frame = x[i:i + win] * np.hanning(win)
+        frame = x[i:i + win] * hwin
         spec = np.fft.rfft(frame)
-        freqs = np.fft.rfftfreq(win, d=1 / fs)
         mag_db = 20 * np.log10(np.abs(spec) + 1e-12)
 
-        mask = (freqs >= target_freq - freq_tol) & (freqs <= target_freq + freq_tol)
-        if np.any(mask) and (float(np.max(mag_db[mask])) > float(threshold_db)):
-            if not offsets or (i - offsets[-1] > min_sep):
-                offsets.append(i)
+        best_freq = None
+        best_db = -300.0
+        for tf in targets:
+            mask = (freqs >= tf - freq_tol) & (freqs <= tf + freq_tol)
+            if not np.any(mask):
+                continue
+            cur_db = float(np.max(mag_db[mask]))
+            if cur_db > best_db:
+                best_db = cur_db
+                best_freq = tf
 
-    return offsets
+        if best_freq is None:
+            continue
+
+        if best_db > float(threshold_db):
+            if not events or (i - events[-1][0] > min_sep):
+                events.append((i, best_freq))
+
+    return events
 
 def crop_between_frequency_flags(
     x: np.ndarray,
     fs: int,
-    target_freq: float = 5500.0,
+    start_freqs: Sequence[float] = (3000.0,),
+    end_freqs: Optional[Sequence[float]] = None,
     **kwargs
 ):
-    offsets = detect_frequency_flags(x, fs, target_freq=target_freq, **kwargs)
-    if len(offsets) < 2:
+    end_freqs = end_freqs if end_freqs is not None else start_freqs
+    freq_list = list(start_freqs) + list(end_freqs)
+    events = detect_tone_events(x, fs, target_freqs=freq_list, **kwargs)
+
+    start_candidates = [o for o, f in events if f in start_freqs]
+    end_candidates = [o for o, f in events if f in end_freqs]
+
+    if not start_candidates or not end_candidates:
         return x, x.copy(), fs, 0, len(x)
 
-    start = int(offsets[0])
-    end   = int(offsets[-1])
-    end = max(start + 1, min(end, len(x)))
+    start = int(start_candidates[0])
+    end_flag = int(end_candidates[-1])
+    end = max(start + 1, min(end_flag + int(2.0 * fs), len(x)))
     return x, x[start:end], fs, start, end
 
 # =========================================================
@@ -174,21 +206,47 @@ def split_channels_by_internal_beeps(
     x: np.ndarray,
     fs: int,
     n_channels: int = 6,
-    marker_freq: float = 4500.0,
+    marker_freq: Sequence[float] | float = (4500.0,),
     freq_tol: float = 40.0,
-    threshold_db: float = -40.0
+    threshold_db: float = -40.0,
+    beep_duration_s: float = 2.0,
+    silence_after_beep_s: float = 2.0,
+    sweep_duration_s: float = 4.0,
 ) -> Tuple[List[np.ndarray], List[int]]:
     """
-    Detecta beeps internos (4.5 kHz) y segmenta.
-    Devuelve: (segments, markers)
+    Detecta beeps internos y recorta los barridos asociados.
+
+    Cada beep dura 2 s, seguido de 2 s de silencio y luego un barrido de 4 s.
+    Se usan los primeros ``n_channels`` beeps detectados para construir los
+    segmentos de canal. Si no se detecta nada, cae en segmentos iguales.
     """
-    markers = detect_frequency_flags(
+
+    freq_list = marker_freq if isinstance(marker_freq, (list, tuple, np.ndarray)) else (marker_freq,)
+    events = detect_tone_events(
         x, fs,
-        target_freq=marker_freq,
+        target_freqs=freq_list,
         freq_tol=freq_tol,
         threshold_db=threshold_db
     )
-    segs = split_by_markers(x, markers, n_channels=n_channels)
+
+    if not events:
+        return split_equal_segments(x, n_channels), []
+
+    hop_start = int((beep_duration_s + silence_after_beep_s) * fs)
+    sweep_len = int(sweep_duration_s * fs)
+
+    segs: List[np.ndarray] = []
+    markers: List[int] = []
+    for offset, _freq in events[:n_channels]:
+        start = offset + hop_start
+        end = min(len(x), start + sweep_len)
+        markers.append(int(offset))
+        segs.append(x[start:end])
+
+    # rellenar si faltan canales
+    if len(segs) < n_channels:
+        segs.extend([np.array([], dtype=x.dtype) for _ in range(n_channels - len(segs))])
+
     return segs, markers
 
 # =========================================================
