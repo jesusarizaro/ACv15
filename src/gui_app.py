@@ -467,13 +467,14 @@ class AudioCinemaGUI:
 
         x_cur = record_audio(dur, fs=fs, channels=1, device=self.input_device_index)
 
-        # recorte global (5.5 kHz)
-        x_ref_o, x_ref_cut, fs, ref_start, ref_end = crop_between_frequency_flags(x_ref, fs, target_freq=5500.0)
-        x_cur_o, x_cur_cut, fs, cur_start, cur_end = crop_between_frequency_flags(x_cur, fs, target_freq=5500.0)
+        # recorte global usando banderas de 3 kHz (inicio/fin)
+        x_ref_o, x_ref_cut, fs, ref_start, ref_end = crop_between_frequency_flags(x_ref, fs, start_freqs=(3000.0,))
+        x_cur_o, x_cur_cut, fs, cur_start, cur_end = crop_between_frequency_flags(x_cur, fs, start_freqs=(3000.0,))
 
-        # split 6 canales con beeps internos (4.5 kHz)
-        ref_segs, ref_markers = split_channels_by_internal_beeps(x_ref_cut, fs, n_channels=6, marker_freq=4500.0)
-        cur_segs, cur_markers = split_channels_by_internal_beeps(x_cur_cut, fs, n_channels=6, marker_freq=4500.0)
+        # split 6 canales con beeps internos (3 kHz inicial + 4.5 kHz internos)
+        marker_freqs = (3000.0, 4500.0)
+        ref_segs, ref_markers = split_channels_by_internal_beeps(x_ref_cut, fs, n_channels=6, marker_freq=marker_freqs)
+        cur_segs, cur_markers = split_channels_by_internal_beeps(x_cur_cut, fs, n_channels=6, marker_freq=marker_freqs)
 
         channel_results = []
         for rseg, cseg in zip(ref_segs, cur_segs):
