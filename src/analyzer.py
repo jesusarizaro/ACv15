@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 from datetime import datetime
-#from typing import List, Tuple, Optional, Any
 from typing import List, Tuple, Optional, Any, Sequence
 
 import numpy as np
@@ -81,11 +80,12 @@ def welch_db(x: np.ndarray, fs: int, nperseg: int = 4096):
 # DETECCIÓN DE BANDERAS + RECORTES
 # =========================================================
 
-#def detect_frequency_flags(
 def detect_tone_events(
     x: np.ndarray,
     fs: int,
-    target_freqs: Sequence[float],
+    target_freqs: Optional[Sequence[float]] = None,
+    *,
+    target_freq: Optional[float | Sequence[float]] = None,
     freq_tol: float = 40.0,
     threshold_db: float = -40.0,
     win_ms: float = 30.0,
@@ -99,7 +99,18 @@ def detect_tone_events(
     se selecciona el objetivo con mayor magnitud que supere el umbral.
     """
 
-    targets = sorted(set(float(f) for f in target_freqs if f > 0))
+    # Compatibilidad hacia atrás: permitir ``target_freq`` (singular) además de
+    # ``target_freqs``. Si se proporcionan ambos, se unen en un solo conjunto.
+    freq_inputs: List[float] = []
+    if target_freqs is not None:
+        freq_inputs.extend(target_freqs)
+    if target_freq is not None:
+        if isinstance(target_freq, (list, tuple, np.ndarray)):
+            freq_inputs.extend(target_freq)
+        else:
+            freq_inputs.append(float(target_freq))
+
+    targets = sorted(set(float(f) for f in freq_inputs if f > 0))
     win = int(fs * win_ms * 1e-3)
     hop = int(fs * hop_ms * 1e-3)
     min_sep = int(min_sep_s * fs)
