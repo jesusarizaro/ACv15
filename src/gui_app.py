@@ -350,7 +350,9 @@ class AudioCinemaGUI:
 
         def _plot_ref(x: np.ndarray, fs0: int):
             x = normalize_mono(x)
-            x_o, x_cut, fs_u, s, e = crop_between_frequency_flags(x, fs0, target_freq=5500.0)
+            x_o, x_cut, fs_u, s, e = crop_between_frequency_flags(
+                x, fs0, start_freqs=(3000.0,), end_freqs=(3000.0,)
+            )
 
             ax_ref_orig.clear()
             ax_ref_cut.clear()
