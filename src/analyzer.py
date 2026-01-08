@@ -25,6 +25,53 @@ def normalize_mono(x: np.ndarray) -> np.ndarray:
     m = np.max(np.abs(x)) if x.size else 0.0
     return x / (m + 1e-12) if m > 1.0 else x
 
+
+def denoise_audio(
+    x: np.ndarray,
+    fs: int,
+    frame_ms: float = 20.0,
+    hop_ms: float = 10.0,
+    noise_percentile: float = 10.0,
+) -> np.ndarray:
+    """
+    Atenúa ruido de fondo mediante sustracción espectral simple.
+    """
+    if x.size == 0:
+        return x
+
+    nperseg = max(256, int(fs * frame_ms * 1e-3))
+    hop = max(1, int(fs * hop_ms * 1e-3))
+    noverlap = max(0, nperseg - hop)
+
+    frames = _frame_signal(x, nperseg, noverlap)
+    win = np.hanning(nperseg).astype(np.float32)
+
+    spec = np.fft.rfft(frames * win[None, :], axis=1)
+    mag = np.abs(spec)
+
+    noise_mag = np.percentile(mag, noise_percentile, axis=0)
+    mag_denoised = np.maximum(mag - noise_mag, 0.0)
+    gain = mag_denoised / (mag + 1e-12)
+
+    spec_denoised = spec * gain
+    frames_out = np.fft.irfft(spec_denoised, n=nperseg, axis=1).astype(np.float32)
+
+    out = np.zeros((frames_out.shape[0] * hop + nperseg), dtype=np.float32)
+    win_sum = np.zeros_like(out)
+    win_sq = win**2
+    for i in range(frames_out.shape[0]):
+        start = i * hop
+        out[start:start + nperseg] += frames_out[i] * win
+        win_sum[start:start + nperseg] += win_sq
+
+    nonzero = win_sum > 1e-12
+    out[nonzero] /= win_sum[nonzero]
+    return out[:len(x)].astype(np.float32, copy=False)
+
+
+
+
+
 def record_audio(
     duration_sec: float,
     fs: int = 48000,
@@ -37,7 +84,12 @@ def record_audio(
         kwargs["device"] = device
     rec = sd.rec(int(duration_sec * fs), **kwargs)
     sd.wait()
-    return normalize_mono(rec.squeeze())
+    x = rec.squeeze()
+    if x.ndim == 2:
+        x = x.mean(axis=1)
+    x = denoise_audio(x.astype(np.float32, copy=False), fs)
+    return normalize_mono(x)
+
 
 def rms_db(x: np.ndarray) -> float:
     return 20.0 * np.log10(np.sqrt(np.mean(x**2) + 1e-20) + 1e-20)
