@@ -25,6 +25,7 @@ from iot_tb import send_json_to_thingsboard
 
 from analyzer import (
     normalize_mono,
+    denoise_audio,
     record_audio,
     analyze_pair,
     build_json_payload,
@@ -459,6 +460,7 @@ class AudioCinemaGUI:
         x_ref, fs_ref = sf.read(ref_path, dtype="float32", always_2d=False)
         if getattr(x_ref, "ndim", 1) == 2:
             x_ref = x_ref.mean(axis=1)
+        x_ref = denoise_audio(x_ref.astype(np.float32, copy=False), fs_ref)
         x_ref = normalize_mono(x_ref)
 
         if fs_ref != fs:
