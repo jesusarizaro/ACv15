@@ -24,6 +24,9 @@ from configio import load_config, save_config
 from iot_tb import send_json_to_thingsboard
 
 from analyzer import (
+    preprocess_audio,
+    resample_linear,
+    to_mono,
     normalize_mono,
     denoise_audio,
     record_audio,
@@ -255,6 +258,20 @@ class AudioCinemaGUI:
         pref = str(self._cfg(["audio", "preferred_input_name"], ""))
         self.input_device_index = pick_input_device(pref)
 
+
+    def _load_noise_sample(self, target_fs: int) -> Optional[np.ndarray]:
+        noise_path = Path(self._cfg(["noise","wav_path"], str(ASSETS_DIR/"noise_floor.wav")))
+        if not noise_path.exists():
+            return None
+        x_noise, fs_noise = sf.read(noise_path, dtype="float32", always_2d=False)
+        x_noise = to_mono(x_noise)
+        if fs_noise != target_fs:
+            x_noise = resample_linear(x_noise, fs_noise, target_fs)
+        return x_noise
+
+
+
+    
     @ui_action
     def _show_info(self):
         messagebox.showinfo(APP_NAME, INFO_TEXT)
@@ -269,6 +286,7 @@ class AudioCinemaGUI:
         }
         txt = (
             f"Archivo de referencia:\n  {self._cfg(['reference','wav_path'], str(ASSETS_DIR/'reference_master.wav'))}\n\n"
+            f"Archivo de ruido:\n  {self._cfg(['noise','wav_path'], str(ASSETS_DIR/'noise_floor.wav'))}\n\n"
             f"Audio:\n  fs={self._cfg(['audio','fs'],48000)}  duración={self._cfg(['audio','duration_s'],60.0)} s\n"
             f"ThingsBoard:\n  host={tb_cfg['host']}  port={tb_cfg['port']}  TLS={tb_cfg['use_tls']}\n"
         )
@@ -288,11 +306,14 @@ class AudioCinemaGUI:
         # -------- General --------
         g = ttk.Frame(nb); nb.add(g, text="General")
         ref_var = tk.StringVar(value=self._cfg(["reference","wav_path"], str(ASSETS_DIR/"reference_master.wav")))
+        noise_var = tk.StringVar(value=self._cfg(["noise","wav_path"], str(ASSETS_DIR/"noise_floor.wav")))
         oncal_var = tk.StringVar(value=self._cfg(["oncalendar"], "*-*-* 02:00:00"))
         ttk.Label(g, text="Archivo de referencia (.wav):").grid(row=0, column=0, sticky="w", pady=(6,2))
         ttk.Entry(g, textvariable=ref_var, width=52).grid(row=0, column=1, sticky="we", pady=(6,2))
-        ttk.Label(g, text="OnCalendar (systemd):").grid(row=1, column=0, sticky="w", pady=(6,2))
-        ttk.Entry(g, textvariable=oncal_var, width=30).grid(row=1, column=1, sticky="w", pady=(6,2))
+        ttk.Label(g, text="Archivo de ruido (.wav):").grid(row=1, column=0, sticky="w", pady=(6,2))
+        ttk.Entry(g, textvariable=noise_var, width=52).grid(row=1, column=1, sticky="we", pady=(6,2))
+        ttk.Label(g, text="OnCalendar (systemd):").grid(row=2, column=0, sticky="w", pady=(6,2))
+        ttk.Entry(g, textvariable=oncal_var, width=30).grid(row=2, column=1, sticky="w", pady=(6,2))
 
         # -------- Audio --------
         a = ttk.Frame(nb); nb.add(a, text="Audio")
@@ -395,7 +416,14 @@ class AudioCinemaGUI:
             fs_now = int(fs_var.get())
             dur_now = float(dur_var.get())
             try:
-                x = record_audio(dur_now, fs=fs_now, channels=1, device=self.input_device_index)
+                noise_sample = self._load_noise_sample(fs_now)
+                x = record_audio(
+                    dur_now,
+                    fs=fs_now,
+                    channels=1,
+                    device=self.input_device_index,
+                    noise_sample=noise_sample,
+                )
                 ASSETS_DIR.mkdir(parents=True, exist_ok=True)
                 out = (ASSETS_DIR / "reference_master.wav").resolve()
                 sf.write(out, x, fs_now)
@@ -415,11 +443,96 @@ class AudioCinemaGUI:
 
         cargar_referencia_existente()
 
+        # -------- Ruido de fondo --------
+        n = ttk.Frame(nb)
+        nb.add(n, text="Ruido de fondo")
+
+        n.grid_columnconfigure(0, weight=1)
+        n.grid_columnconfigure(1, weight=1)
+
+        fig_noise = Figure(figsize=(8, 3), dpi=100)
+        ax_noise = fig_noise.add_subplot(1, 1, 1)
+        ax_noise.set_title("Ruido de fondo – ORIGINAL")
+        ax_noise.set_xlabel("Tiempo (s)")
+        ax_noise.set_ylabel("Amplitud")
+        ax_noise.grid(True, axis="x", linestyle=":", linewidth=0.8)
+
+        canvas_noise = FigureCanvasTkAgg(fig_noise, master=n)
+        canvas_noise.get_tk_widget().grid(row=0, column=0, columnspan=2, sticky="nsew", padx=10, pady=(10, 8))
+
+        noise_path_var = tk.StringVar(value=noise_var.get())
+        noise_date_var = tk.StringVar(value="—")
+
+        ttk.Label(n, text="Ruta:").grid(row=1, column=0, sticky="e", padx=(10,2))
+        ttk.Label(n, textvariable=noise_path_var, wraplength=520, justify="left").grid(row=1, column=1, sticky="w", padx=(2,10))
+
+        ttk.Label(n, text="Fecha:").grid(row=2, column=0, sticky="e", padx=(10,2))
+        ttk.Label(n, textvariable=noise_date_var).grid(row=2, column=1, sticky="w", padx=(2,10))
+
+        def _plot_noise(x: np.ndarray, fs0: int):
+            x = normalize_mono(x)
+            ax_noise.clear()
+            t1 = np.arange(len(x)) / fs0
+            ax_noise.plot(t1, x, lw=0.7)
+            ax_noise.set_title("Ruido de fondo – ORIGINAL")
+            ax_noise.set_xlabel("Tiempo (s)")
+            ax_noise.set_ylabel("Amplitud")
+            ax_noise.grid(True, axis="x", linestyle=":", linewidth=0.8)
+            fig_noise.tight_layout()
+            canvas_noise.draw_idle()
+
+        def cargar_ruido_existente():
+            try:
+                noise_path = Path(noise_var.get()).resolve()
+                if not noise_path.exists():
+                    return
+                x, fs0 = sf.read(noise_path, dtype="float32", always_2d=False)
+                _plot_noise(x, fs0)
+                noise_path_var.set(str(noise_path))
+                mtime = datetime.fromtimestamp(noise_path.stat().st_mtime)
+                noise_date_var.set(mtime.strftime("%Y-%m-%d %H:%M:%S"))
+            except Exception as e:
+                print("No se pudo cargar ruido:", e)
+
+        def grabar_ruido():
+            fs_now = int(fs_var.get())
+            dur_now = float(dur_var.get())
+            try:
+                x = record_audio(
+                    dur_now,
+                    fs=fs_now,
+                    channels=1,
+                    device=self.input_device_index,
+                    apply_processing=False,
+                )
+                ASSETS_DIR.mkdir(parents=True, exist_ok=True)
+                out = (ASSETS_DIR / "noise_floor.wav").resolve()
+                sf.write(out, x, fs_now)
+
+                noise_var.set(str(out))
+                noise_path_var.set(str(out))
+                noise_date_var.set(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+                _plot_noise(x, fs_now)
+                messagebox.showinfo(APP_NAME, f"Ruido guardado:\n{out}")
+            except Exception as e:
+                messagebox.showerror(APP_NAME, f"No se pudo grabar ruido:\n{e}")
+
+        ttk.Button(n, text="Grabar Ruido de Fondo", command=grabar_ruido).grid(
+            row=3, column=0, columnspan=2, pady=(10, 14), sticky="n"
+        )
+
+        cargar_ruido_existente()
+
+
+        
+
         # -------- Guardar / Cancelar --------
         btns = ttk.Frame(frm); btns.pack(fill=X, pady=(10,0))
 
         def on_save():
             self._set_cfg(["reference","wav_path"], ref_var.get().strip())
+            self._set_cfg(["noise","wav_path"], noise_var.get().strip())
             self._set_cfg(["oncalendar"], oncal_var.get().strip())
             self._set_cfg(["audio","fs"], int(fs_var.get()))
             self._set_cfg(["audio","duration_s"], float(dur_var.get()))
@@ -453,23 +566,25 @@ class AudioCinemaGUI:
         fs  = int(self._cfg(["audio","fs"], 48000))
         dur = float(self._cfg(["audio","duration_s"], 60.0))
 
+        noise_sample = self._load_noise_sample(fs)
+        
         ref_path = Path(self._cfg(["reference","wav_path"], str(ASSETS_DIR/"reference_master.wav")))
         if not ref_path.exists():
             raise FileNotFoundError(f"No existe archivo de referencia:\n{ref_path}")
 
         x_ref, fs_ref = sf.read(ref_path, dtype="float32", always_2d=False)
-        if getattr(x_ref, "ndim", 1) == 2:
-            x_ref = x_ref.mean(axis=1)
-        x_ref = denoise_audio(x_ref.astype(np.float32, copy=False), fs_ref)
-        x_ref = normalize_mono(x_ref)
 
         if fs_ref != fs:
-            n_new = int(round(len(x_ref) * fs / fs_ref))
-            x_idx = np.linspace(0, 1, len(x_ref))
-            new_idx = np.linspace(0, 1, n_new)
-            x_ref = np.interp(new_idx, x_idx, x_ref).astype(np.float32)
+            x_ref = resample_linear(x_ref, fs_ref, fs)
+        x_ref = preprocess_audio(x_ref, fs, noise_sample=noise_sample)
 
-        x_cur = record_audio(dur, fs=fs, channels=1, device=self.input_device_index)
+        x_cur = record_audio(
+            dur,
+            fs=fs,
+            channels=1,
+            device=self.input_device_index,
+            noise_sample=noise_sample,
+        )
 
         # recorte global usando banderas de 3 kHz (inicio/fin)
         x_ref_o, x_ref_cut, fs, ref_start, ref_end = crop_between_frequency_flags(x_ref, fs, start_freqs=(3000.0,))
