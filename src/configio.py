@@ -21,7 +21,10 @@ DEFAULTS = {
         "token": "",
     },
     "reference": {
-        "file": str((ASSETS_DIR / "reference_master.wav").resolve())
+        "wav_path": str((ASSETS_DIR / "reference_master.wav").resolve())
+    },
+    "noise": {
+        "wav_path": str((ASSETS_DIR / "noise_floor.wav").resolve())
     },
 }
 
@@ -37,14 +40,16 @@ def load_config() -> dict:
             data = yaml.safe_load(f) or {}
     # merge superficial + asegurar secciones
     out = DEFAULTS | data
-    for k in ("general","audio","thingsboard","reference"):
+    for k in ("general","audio","thingsboard","reference","noise"):
         out.setdefault(k, {})
         out[k] = DEFAULTS[k] | out[k]
+    if "file" in out["reference"] and "wav_path" not in out["reference"]:
+        out["reference"]["wav_path"] = out["reference"]["file"]
     return out
 
 def save_config(cfg: dict) -> None:
     _ensure_dirs()
-    for k in ("general","audio","thingsboard","reference"):
+    for k in ("general","audio","thingsboard","reference","noise"):
         cfg.setdefault(k, {})
         cfg[k] = DEFAULTS[k] | cfg[k]
     with open(CFG_PATH, "w", encoding="utf-8") as f:
