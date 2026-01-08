@@ -18,13 +18,15 @@ DEAD_PEAK   = 0.02      # pico mínimo (señal normalizada)
 # UTILIDADES BÁSICAS DE AUDIO
 # =========================================================
 
-def normalize_mono(x: np.ndarray) -> np.ndarray:
+def to_mono(x: np.ndarray) -> np.ndarray:
     if x.ndim == 2:
         x = x.mean(axis=1)
-    x = x.astype(np.float32, copy=False)
+    return x.astype(np.float32, copy=False)
+
+def normalize_mono(x: np.ndarray) -> np.ndarray:
+    x = to_mono(x)
     m = np.max(np.abs(x)) if x.size else 0.0
     return x / (m + 1e-12) if m > 1.0 else x
-
 
 def denoise_audio(
     x: np.ndarray,
@@ -68,6 +70,36 @@ def denoise_audio(
     out[nonzero] /= win_sum[nonzero]
     return out[:len(x)].astype(np.float32, copy=False)
 
+def subtract_noise_sample(x: np.ndarray, noise: np.ndarray) -> np.ndarray:
+    if x.size == 0 or noise.size == 0:
+        return x
+    x = to_mono(x)
+    noise = to_mono(noise)
+    if len(noise) < len(x):
+        reps = int(np.ceil(len(x) / len(noise)))
+        noise = np.tile(noise, reps)
+    noise = noise[:len(x)]
+    return (x - noise).astype(np.float32, copy=False)
+
+def preprocess_audio(
+    x: np.ndarray,
+    fs: int,
+    noise_sample: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    x = to_mono(x)
+    x = denoise_audio(x, fs)
+    if noise_sample is not None and noise_sample.size:
+        x = subtract_noise_sample(x, noise_sample)
+    return normalize_mono(x)
+
+def resample_linear(x: np.ndarray, fs_in: int, fs_out: int) -> np.ndarray:
+    if fs_in == fs_out or x.size == 0:
+        return x.astype(np.float32, copy=False)
+    n_new = int(round(len(x) * fs_out / fs_in))
+    x_idx = np.linspace(0, 1, len(x))
+    new_idx = np.linspace(0, 1, n_new)
+    return np.interp(new_idx, x_idx, x).astype(np.float32)
+
 
 
 
@@ -76,7 +108,9 @@ def record_audio(
     duration_sec: float,
     fs: int = 48000,
     channels: int = 1,
-    device: Optional[int] = None
+    device: Optional[int] = None,
+    noise_sample: Optional[np.ndarray] = None,
+    apply_processing: bool = True,
 ) -> np.ndarray:
     duration_sec = max(0.5, float(duration_sec))
     kwargs = dict(samplerate=fs, channels=channels, dtype="float32")
@@ -85,10 +119,19 @@ def record_audio(
     rec = sd.rec(int(duration_sec * fs), **kwargs)
     sd.wait()
     x = rec.squeeze()
-    if x.ndim == 2:
-        x = x.mean(axis=1)
-    x = denoise_audio(x.astype(np.float32, copy=False), fs)
-    return normalize_mono(x)
+    if not apply_processing:
+        return to_mono(x)
+    return preprocess_audio(x, fs, noise_sample=noise_sample)
+
+
+
+
+
+
+
+
+
+
 
 
 def rms_db(x: np.ndarray) -> float:
